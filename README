@@ -1,0 +1,607 @@
+# Writing project files (Arduino sketches, README, and detailed PDF) for Exercise3 (parts 1-4).
+# This code creates files under /mnt/data/Exercise3 with sketches and a README, then creates a PDF doc (detailed explanation).
+from pathlib import Path
+from fpdf import FPDF
+import textwrap
+import json
+base = Path("/mnt/data/Exercise3")
+base.mkdir(parents=True, exist_ok=True)
+
+# Create folder structure
+for part in ["part1_oneway", "part2_bidi", "part3_broadcast", "part4_advanced"]:
+    (base/part).mkdir(exist_ok=True)
+
+# Common receiver sketch (used in part1/part2/part3)
+receiver_code = r'''#include <WiFi.h>
+#include <esp_now.h>
+
+/*
+  ESP32 ESP-NOW Receiver (Arduino IDE)
+  - Prints received messages to Serial.
+  - Use this sketch on the Receiver board(s).
+  - To get this board's MAC address, open Serial Monitor after boot.
+*/
+
+void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len){
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.print("Received from: "); Serial.println(macStr);
+  Serial.print("Len="); Serial.println(len);
+  Serial.print("Data: ");
+  // incomingData is raw bytes; print as string safely
+  Serial.write(incomingData, len);
+  Serial.println();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nESP-NOW Receiver starting...");
+  
+  // Set device as a Wi-Fi Station (no AP)
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  // Print MAC address so sender(s) can use it
+  Serial.print("Receiver MAC: ");
+  Serial.println(WiFi.macAddress());
+  
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    while(true) delay(1000);
+  }
+
+  // Register callback for receiving data
+  esp_now_register_recv_cb(onDataRecv);
+}
+
+void loop() {
+  // Receiver simply waits for incoming ESP-NOW packets and prints them in callback.
+  delay(1000);
+}
+'''
+
+# Part1: one-way sender (simple string send)
+sender_part1 = r'''#include <WiFi.h>
+#include <esp_now.h>
+
+/*
+  ESP32 ESP-NOW Sender (One-way)
+  - Replace peerAddress with the Receiver's MAC address printed by the receiver Serial.
+  - Sends a "Hello" message every 2 seconds.
+*/
+
+uint8_t peerAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF}; // REPLACE with receiver MAC (broadcast used by default)
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+  Serial.print("Last Packet to: "); Serial.print(macStr);
+  Serial.print(" Status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nESP-NOW One-way Sender starting...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    while(true) delay(1000);
+  }
+
+  esp_now_register_send_cb(onDataSent);
+
+  // Register peer (optional for broadcast). To send to a specific receiver, replace peerAddress with its MAC.
+  esp_now_peer_info_t peerInfo;
+  memcpy(peerInfo.peer_addr, peerAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+
+  // Add peer (if adding fails that's often okay for broadcast or unknown peer)
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer (may be broadcast or already added).");
+  } else {
+    Serial.println("Peer added.");
+  }
+}
+
+void loop() {
+  const char *message = "Hello from Sender (One-way)";
+  // send to peerAddress (if peerAddress is broadcast FF:FF:... this becomes a broadcast)
+  esp_err_t result = esp_now_send(peerAddress, (uint8_t *)message, strlen(message));
+  if (result == ESP_OK) {
+    Serial.println("Send OK");
+  } else {
+    Serial.print("Send Error: "); Serial.println(result);
+  }
+  delay(2000);
+}
+'''
+
+# Part2: bidirectional (sender sends sensor struct, receiver replies ACK)
+sender_part2 = r'''#include <WiFi.h>
+#include <esp_now.h>
+
+/*
+  ESP32 ESP-NOW Bidirectional Example (Sender)
+  - Sender sends a struct with id + sensor value.
+  - Waits for ACK message from Receiver (registered as rx callback).
+  - Replace peerAddress with Receiver MAC.
+*/
+
+typedef struct struct_message {
+  int id;
+  float sensorValue;
+} struct_message;
+
+uint8_t peerAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF}; // REPLACE
+
+void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len){
+  Serial.print("ACK Received: ");
+  Serial.write(incomingData, len);
+  Serial.println();
+}
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nESP-NOW Bidirectional Sender starting...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    while(true) delay(1000);
+  }
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataRecv);
+
+  esp_now_peer_info_t peerInfo;
+  memcpy(peerInfo.peer_addr, peerAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer.");
+  }
+}
+
+void loop() {
+  static int packetId = 0;
+  struct_message dataToSend;
+  dataToSend.id = packetId++;
+  dataToSend.sensorValue = random(200, 300) / 10.0; // fake sensor
+
+  esp_err_t result = esp_now_send(peerAddress, (uint8_t *)&dataToSend, sizeof(dataToSend));
+  if (result == ESP_OK) {
+    Serial.print("Sent id="); Serial.print(dataToSend.id);
+    Serial.print(" val="); Serial.println(dataToSend.sensorValue);
+  } else {
+    Serial.print("Error sending: "); Serial.println(result);
+  }
+
+  delay(2000);
+}
+'''
+
+receiver_part2 = r'''#include <WiFi.h>
+#include <esp_now.h>
+
+/*
+  ESP32 ESP-NOW Bidirectional Example (Receiver)
+  - Receives struct_message, prints it, replies ACK string to sender.
+*/
+
+typedef struct struct_message {
+  int id;
+  float sensorValue;
+} struct_message;
+
+void sendAck(const uint8_t *peerMac) {
+  const char *ack = "Received";
+  esp_err_t res = esp_now_send(peerMac, (uint8_t *)ack, strlen(ack));
+  if (res == ESP_OK) {
+    Serial.println("ACK sent.");
+  } else {
+    Serial.print("ACK send error: "); Serial.println(res);
+  }
+}
+
+void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len){
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.print("Received from: "); Serial.println(macStr);
+  if (len == sizeof(struct_message)) {
+    struct_message msg;
+    memcpy(&msg, incomingData, len);
+    Serial.print("id="); Serial.print(msg.id);
+    Serial.print(" val="); Serial.println(msg.sensorValue);
+  } else {
+    Serial.print("Data (len="); Serial.print(len); Serial.println("): ");
+    Serial.write(incomingData, len);
+    Serial.println();
+  }
+
+  // Send ACK back to sender
+  sendAck(mac);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nESP-NOW Bidirectional Receiver starting...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  Serial.print("Receiver MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    while(true) delay(1000);
+  }
+  esp_now_register_recv_cb(onDataRecv);
+}
+
+void loop() {
+  delay(1000);
+}
+'''
+
+# Part3: broadcast sender (sends to FF:FF:FF:FF:FF:FF)
+sender_part3 = r'''#include <WiFi.h>
+#include <esp_now.h>
+
+/*
+  ESP32 ESP-NOW Broadcast Example (Sender)
+  - Broadcasts a message to all listening ESP-NOW devices.
+  - Receivers must be running the generic receiver sketch.
+*/
+
+uint8_t broadcastAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Broadcast send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nESP-NOW Broadcast Sender starting...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    while(true) delay(1000);
+  }
+  esp_now_register_send_cb(onDataSent);
+}
+
+void loop() {
+  const char *message = "ESP-NOW Broadcast: Hello all nodes!";
+  esp_err_t res = esp_now_send(broadcastAddress, (uint8_t *)message, strlen(message));
+  if (res == ESP_OK) {
+    Serial.println("Broadcast queued");
+  } else {
+    Serial.print("Broadcast error: "); Serial.println(res);
+  }
+  delay(3000);
+}
+'''
+
+# Part4: advanced - ESP-NOW + WiFi station + measure latency (simple)
+advanced_sender = r'''#include <WiFi.h>
+#include <esp_now.h>
+
+/*
+  ESP-NOW Advanced Example (Sender)
+  - Connects to Wi-Fi AP (optional) while also using ESP-NOW.
+  - Sends timestamp and measures RTT if receiver echoes timestamp back.
+  - Replace peerAddress with receiver's MAC.
+  - NOTES: This sketch demonstrates coexistence of Wi-Fi station and ESP-NOW on ESP32.
+*/
+
+uint8_t peerAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF}; // REPLACE
+
+void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len){
+  // Expect receiver to echo timestamp (uint32_t millis)
+  if (len == sizeof(uint32_t)) {
+    uint32_t t;
+    memcpy(&t, incomingData, sizeof(t));
+    uint32_t now = millis();
+    Serial.print("Echoed timestamp: "); Serial.println(t);
+    Serial.print("RTT (ms): "); Serial.println(now - t);
+  } else {
+    Serial.print("Recv len="); Serial.println(len);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nESP-NOW Advanced Sender starting...");
+
+  // Connect to Wi-Fi AP (optional). Replace with your SSID/PASS if you want WAN connectivity.
+  const char* ssid = "YOUR_SSID";
+  const char* pass = "YOUR_PASS";
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  Serial.print("Connecting to Wi-Fi...");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
+    delay(200);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Wi-Fi connected. IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Wi-Fi not connected (continuing with ESP-NOW).");
+  }
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    while(true) delay(1000);
+  }
+  esp_now_register_recv_cb(onDataRecv);
+}
+
+void loop() {
+  uint32_t t = millis();
+  esp_err_t res = esp_now_send(peerAddress, (uint8_t*)&t, sizeof(t));
+  if (res == ESP_OK) {
+    Serial.print("Sent timestamp: "); Serial.println(t);
+  } else {
+    Serial.print("Send failed: "); Serial.println(res);
+  }
+  delay(2000);
+}
+'''
+
+advanced_receiver = r'''#include <WiFi.h>
+#include <esp_now.h>
+
+/*
+  ESP-NOW Advanced Receiver
+  - Receives timestamp (uint32_t) and echoes it back to sender (to measure RTT).
+  - Demonstrates coexistence with Wi-Fi station mode.
+*/
+
+void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len){
+  if (len == sizeof(uint32_t)) {
+    uint32_t t;
+    memcpy(&t, incomingData, sizeof(t));
+    Serial.print("Received timestamp: "); Serial.println(t);
+    // Echo back to sender to measure RTT
+    esp_now_send(mac, incomingData, len);
+    Serial.println("Echoed back.");
+  } else {
+    Serial.print("Received len="); Serial.println(len);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nESP-NOW Advanced Receiver starting...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    while(true) delay(1000);
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+  Serial.print("Receiver MAC: ");
+  Serial.println(WiFi.macAddress());
+}
+
+void loop() {
+  delay(1000);
+}
+'''
+
+# Write sketches
+files = {
+    base/"part1_oneway"/"receiver.ino": receiver_code,
+    base/"part1_oneway"/"sender.ino": sender_part1,
+    base/"part2_bidi"/"sender.ino": sender_part2,
+    base/"part2_bidi"/"receiver.ino": receiver_part2,
+    base/"part3_broadcast"/"sender.ino": sender_part3,
+    base/"part3_broadcast"/"receiver.ino": receiver_code,
+    base/"part4_advanced"/"sender.ino": advanced_sender,
+    base/"part4_advanced"/"receiver.ino": advanced_receiver,
+}
+
+for p, content in files.items():
+    p.write_text(content)
+
+# Create README.md summarizing repository structure and upload instructions for GitHub and Google Sheets
+readme = f"""# Exercise3 - ESP-NOW Assignment
+This repository contains the ESP-NOW exercises required for Exercise 3.  
+Structure:
+- part1_oneway/
+  - sender.ino   -> One-way sender example
+  - receiver.ino -> Receiver
+- part2_bidi/
+  - sender.ino   -> Bidirectional sender (sends struct, waits for ACK)
+  - receiver.ino -> Bidirectional receiver (replies ACK)
+- part3_broadcast/
+  - sender.ino   -> Broadcast sender (FF:FF:FF:FF:FF:FF)
+  - receiver.ino -> Receiver (same as part1 receiver)
+- part4_advanced/
+  - sender.ino   -> Advanced: ESP-NOW coexisting with Wi-Fi and timestamp RTT
+  - receiver.ino -> Echo receiver (echoes timestamp to measure RTT)
+
+## How to use
+1. Open the respective `.ino` in Arduino IDE (select ESP32 board e.g. "ESP32 Dev Module").
+2. For one-way and bidirectional examples, replace the `peerAddress` array in sender sketches with the receiver MAC printed on the receiver's Serial Monitor (format: AA:BB:CC:DD:EE:FF -> bytes).
+3. Upload `receiver.ino` to the receiver board(s) and open Serial Monitor (115200) to see messages.
+4. Upload `sender.ino` to the sender board(s). Observe Serial for send-status messages.
+
+## GitHub & Google Sheet submission
+- Create a GitHub repository (private or public) for your group and upload the `Exercise3` folder at project root.
+- Make sure files are organized under `Exercise3/part1_oneway`, `Exercise3/part2_bidi`, `Exercise3/part3_broadcast`, `Exercise3/part4_advanced`.
+- Provide the repository URL in the group's Google Sheet cell for the assignment so the instructor can review.
+
+## Notes & Troubleshooting
+- Make sure both devices use the same Wi-Fi channel for best reliability. By default esp_now uses current Wi-Fi channel 0 (auto). If using fixed channels, set `peerInfo.channel`.
+- If `esp_now_add_peer` fails, try removing existing peers or rebooting devices.
+- Use broadcast (FF:FF:FF:FF:FF:FF) to reach all devices but you won't get per-peer status if many devices exist.
+"""
+
+(base/"README.md").write_text(readme)
+
+# Create detailed PDF (line-by-line explanation)
+pdf = FPDF()
+pdf.set_auto_page_break(True, margin=15)
+pdf.add_page()
+pdf.set_font("Arial", size=12)
+pdf.cell(0, 8, "Exercise 3 - ESP-NOW (Detailed Documentation)", ln=True, align="C")
+pdf.ln(4)
+intro = """This document explains the provided ESP-NOW sketches in detail. Each sketch is written for the Arduino IDE and intended to run on ESP32-series boards (e.g., ESP32 DevKitC WROOM). The goal is to help students understand each function, callback, and variable used in the examples."""
+pdf.multi_cell(0, 6, intro)
+pdf.ln(4)
+
+def add_section(title, text):
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0,6,title, ln=True)
+    pdf.set_font("Arial", size=11)
+    pdf.multi_cell(0,5,text)
+    pdf.ln(2)
+
+# Part 1 explanation
+add_section("Part 1 - One-way (Sender -> Receiver)",
+"""Files: sender.ino, receiver.ino
+
+Receiver overview:
+- #include <WiFi.h>: includes WiFi functions (needed to set Wi-Fi mode and get MAC).
+- #include <esp_now.h>: ESP-NOW API for Arduino on ESP32.
+- onDataRecv(...): callback invoked by ESP-NOW when a packet arrives.
+  * mac: pointer to sender MAC address (6 bytes).
+  * incomingData: pointer to received payload bytes.
+  * len: number of bytes in payload.
+- setup():
+  * Serial.begin(115200): starts serial for debugging.
+  * WiFi.mode(WIFI_STA): set station mode (not an Access Point). ESP-NOW typically uses STA mode.
+  * WiFi.disconnect(): ensure not connected to AP (optional).
+  * WiFi.macAddress(): prints the board MAC so sender can use it.
+  * esp_now_init(): initializes ESP-NOW stack. Returns ESP_OK on success.
+  * esp_now_register_recv_cb(onDataRecv): register the receive callback.
+- loop(): idle; incoming messages handled in callback.
+
+Sender overview:
+- peerAddress[]: 6-byte MAC of the receiver. Replace with receiver MAC printed by receiver Serial.
+- onDataSent(...): callback called after esp_now_send completes (success or fail).
+  * mac_addr: MAC of peer attempted.
+  * status: ESP_NOW_SEND_SUCCESS or ESP_NOW_SEND_FAIL.
+- setup():
+  * Initialize Wi-Fi STA mode and ESP-NOW like receiver.
+  * esp_now_register_send_cb(onDataSent): register send status callback.
+  * esp_now_peer_info_t peerInfo: structure to optionally register peer (mac, channel, encrypt).
+  * esp_now_add_peer(&peerInfo): add peer to peer list. Not strictly required for simple sends to broadcast.
+- loop(): calls esp_now_send(peerAddress, payload, len) to queue a packet.
+
+Why this helps students:
+- Demonstrates how two devices communicate without an AP/router.
+- Shows how callbacks decouple packet handling from loop.
+""")
+
+# Part2 explanation
+add_section("Part 2 - Two-way (Bidirectional)",
+"""Files: sender.ino, receiver.ino
+
+Design:
+- A struct 'struct_message' carrying id and sensorValue is used to send typed data.
+- Sender sends the struct; Receiver reads and replies with an ACK string "Received".
+- Sender registers a receive callback to get ACKs; receiver uses esp_now_send to reply to the sender's MAC.
+
+Key functions & concepts:
+- typedef struct struct_message { int id; float sensorValue; } struct_message;
+  * Using fixed-size structs ensures both sender and receiver interpret bytes the same way.
+- memcpy usage: to copy bytes into/out of struct.
+- esp_now_register_recv_cb(): used on both ends if a device both sends and receives.
+- Replying to sender uses the sender's MAC passed into the receive callback (mac parameter).
+- This demonstrates request/response patterns and basic reliability through ACKs.
+""")
+
+# Part3 explanation
+add_section("Part 3 - Multi-device (Broadcast/Multicast)",
+"""Files: sender.ino (broadcast), receiver.ino
+
+- Broadcast uses the special MAC FF:FF:FF:FF:FF:FF as receiver address in esp_now_send.
+- All devices listening in receive mode will get the message simultaneously.
+- Useful for sending configuration, commands, or time sync to many nodes.
+- Limitations: replies from many nodes at once may collide; ESP-NOW does not provide higher-level collision handling.
+""")
+
+# Part4 explanation
+add_section("Part 4 - ESP-NOW Advanced (ESP-NOW + Wi-Fi + latency + basic security)",
+"""Files: sender.ino, receiver.ino (advanced)
+
+- Coexistence: ESP32 allows ESP-NOW to run alongside Wi-Fi station mode. This sketch optionally connects to an AP while still sending ESP-NOW. Note that heavy Wi-Fi traffic may affect ESP-NOW timing and reliability.
+- Latency measurement: sender sends current millis() as a 32-bit integer. Receiver echoes the same bytes back; sender computes RTT = now - sent_time.
+- Security (notes):
+  * ESP-NOW supports encrypted peers. In lower-level APIs you can set a peer's 'encrypt' flag when calling esp_now_add_peer and provide a 16-byte key (LMK/PMK).
+  * Enabling encryption requires both sides to configure the same key; this example leaves encryption off for simplicity.
+  * For production, consult ESP-IDF docs for esp_now_set_pmk() and esp_now_add_peer with encryption parameters.
+""")
+
+# Add upload & GitHub instructions
+add_section("Upload & GitHub submission checklist",
+"""1. Compile each sketch in Arduino IDE (select correct ESP32 board and COM port). Fix board selection if compile errors appear.
+2. Upload receiver sketch(s) first, open Serial Monitor, note MAC addresses.
+3. Edit sender sketches: replace peerAddress[] with the receiver's MAC bytes (example: {0x24,0x6F,0x28,0xAA,0xBB,0xCC}).
+4. Upload sender sketch(s).
+5. Run tests: One-way (check prints), Two-way (check ACK), Broadcast (multiple receivers), Advanced (measure RTT, try connecting to Wi-Fi).
+6. Push the Exercise3 folder to your group's GitHub repo and paste the repo URL into the Google Sheet cell reserved for your group.
+
+If you encounter errors, common fixes:
+- 'Error initializing ESP-NOW' -> try resetting board and re-upload sketch.
+- esp_now_add_peer returns error -> ensure correct MAC bytes, reboot boards, or omit adding peer for broadcast.
+""")
+
+# Save PDF
+pdf_path = base/"Exercise3_ESP-NOW_Detailed_Documentation.pdf"
+pdf.output(str(pdf_path))
+
+# Create a ZIP of the Exercise3 folder for easy download
+import shutil
+zip_path = Path("/mnt/data/Exercise3_package.zip")
+if zip_path.exists():
+    zip_path.unlink()
+shutil.make_archive(str(zip_path).replace('.zip',''), 'zip', str(base))
+
+# Print output listing files created
+file_list = []
+for p in base.rglob('*'):
+    if p.is_file():
+        file_list.append(str(p.relative_to('/mnt/data')))
+
+result = {
+    "created_files": file_list,
+    "zip": str(zip_path),
+    "pdf": str(pdf_path)
+}
+
+print(json.dumps(result, indent=2))
+
